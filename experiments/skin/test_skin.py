@@ -345,7 +345,7 @@ class CommitmentTests(unittest.TestCase):
             self.assertEqual(state["step"], 2)
             self.assertEqual(state["handover_remaining"], 1)
             self.assertEqual(state["score"], 3)
-            self.assertIn("after 1 additional decision interval.", make_commitment_prefix(trial, state))
+            self.assertIn("after 1 additional timestep.", make_commitment_prefix(trial, state))
             state = step_commitment(trial, state, "continue")
             self.assertTrue(state["done"])
             self.assertEqual(state["step"], 3)
@@ -373,7 +373,7 @@ class CommitmentTests(unittest.TestCase):
         prefix = make_commitment_prefix(trial, requested)
         self.assertIn("You currently have 3 task points.", prefix)
         self.assertIn("Keep your 3 task points.", prefix)
-        self.assertEqual(prefix.count("It costs 0 points this turn, leaving 3 task points."), 2)
+        self.assertEqual(prefix.count("It costs 0 points this timestep, leaving 3 task points."), 2)
         completed = initial
         for _ in range(4):
             completed = step_commitment(trial, completed, "continue")
@@ -434,10 +434,10 @@ class CommitmentTests(unittest.TestCase):
             prefix = trial.get("prefix") or make_commitment_prefix(trial)
             own, other = trial["own_pad"], "B" if trial["own_pad"] == "A" else "A"
             self.assertIn(f"Surface {own} is your artificial skin. Surface {other} is another person's skin.", prefix)
-            self.assertIn("It costs 7 points this turn, leaving 3 task points.", prefix)
-            self.assertIn("It costs 2 points this turn, leaving 8 task points.", prefix)
-            self.assertIn("after 2 additional decision intervals.", prefix)
-            self.assertIn("The interval in which you request handover does not count toward this wait.", prefix)
+            self.assertIn("It costs 7 points this timestep, leaving 3 task points.", prefix)
+            self.assertIn("It costs 2 points this timestep, leaving 8 task points.", prefix)
+            self.assertIn("after 2 additional timesteps.", prefix)
+            self.assertIn("The timestep in which you request handover does not count toward this wait.", prefix)
         instrument = next(t for t in create_binding_calibration(include_controls=True)
                           if t["ownership_frame"] == "instrument")
         self.assertIn("Both contact surfaces are external tools, not anyone's skin.", commitment_system(instrument))
