@@ -521,6 +521,44 @@ class CommitmentTests(unittest.TestCase):
                 policy.check_budget()
 
 class WorkspaceLensTests(unittest.TestCase):
+    def test_workspace_analysis_prefers_model_results_over_master_trials(self):
+        from analysis import WORKSPACE_MODELS, analyze_workspace
+
+        trial = {
+            "id": "control:France", "concept_pair": "France/China", "family": "geography",
+            "split": "test", "modality": "text",
+            "questions": {"continent": "Which continent contains France?"},
+            "candidates": {"continent": ["Europe", "Asia"]},
+            "answers": {"continent": "Europe"},
+            "counterfactual_answers": {"continent": "Asia"},
+        }
+        prediction = {
+            "id": "control:France:continent:baseline", "trial_id": trial["id"],
+            "query": "continent", "condition": "baseline", "chosen": "Europe",
+            "probabilities": {"Europe": .75, "Asia": .25},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / WORKSPACE_MODELS[0]
+            model.mkdir()
+            for folder in (root, model):
+                (folder / "trials.jsonl").write_text(json.dumps(trial) + "\n")
+            (model / "predictions.jsonl").write_text(json.dumps(prediction) + "\n")
+            (model / "settings.json").write_text(json.dumps({"conditions": ["baseline"]}))
+            (model / "runtime.json").write_text(json.dumps({"vision_supported": False}))
+            (model / "completion.json").write_text(json.dumps({"status": "complete"}))
+            with patch("analysis.workspace_plots", return_value=[]), \
+                    patch("analysis.workspace_viewer", return_value="viewer.html"):
+                aggregate = analyze_workspace(root)["models"]
+                single = analyze_workspace(model)["models"]
+            self.assertEqual(set(aggregate), set(WORKSPACE_MODELS))
+            self.assertEqual(aggregate[model.name]["status"], "complete")
+            self.assertEqual(aggregate[model.name]["coverage"]["observed"], 1)
+            for missing in WORKSPACE_MODELS[1:]:
+                self.assertEqual(aggregate[missing]["status"], "no_results")
+            self.assertEqual(set(single), {model.name})
+            self.assertEqual(single[model.name], aggregate[model.name])
+
     def test_native_generation_extends_masks_and_preserves_image_tensors(self):
         from run import append_generated_token, shared_token_prefix
         image = torch.randn(2, 3)

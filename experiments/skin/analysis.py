@@ -1337,11 +1337,12 @@ def analyze_workspace(root):
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(root)
-    single = (root / "trials.jsonl").exists() or root.name in WORKSPACE_MODELS
+    children = [folder for folder in sorted(root.iterdir())
+                if folder.is_dir() and (folder / "trials.jsonl").exists()]
+    single = not children and ((root / "trials.jsonl").exists() or root.name in WORKSPACE_MODELS)
     folders = [root] if single else [root / name for name in WORKSPACE_MODELS]
     if not single:
-        folders += [folder for folder in sorted(root.iterdir())
-                    if folder.is_dir() and folder not in folders and (folder / "trials.jsonl").exists()]
+        folders += [folder for folder in children if folder not in folders]
     records, scenario_records, coordinate_records, prediction_records, model_results = [], [], [], [], {}
 
     def record(model, rows, metadata, values=None):
