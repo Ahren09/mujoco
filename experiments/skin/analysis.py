@@ -779,6 +779,15 @@ def analyze_pilot(output_dir, seed=42):
 def analyze_commitments(directory):
     """Summarize completed episodes and paired interventions by their original IDs."""
     directory = Path(directory)
+    settings_path = directory / "settings.json"
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    trial_path, binding_path = directory / "trials.jsonl", directory / "binding.jsonl"
+    planned_episodes = (len(read_jsonl(trial_path)) if trial_path.exists()
+                        else settings.get("episodes"))
+    planned_binding = (len(read_jsonl(binding_path)) * 4 * 3 if binding_path.exists()
+                       else settings.get("binding_forwards"))
+    if settings.get("part") == "behavior":
+        planned_binding = 0
     rows = []
     episodes = []
     usage = []
@@ -851,9 +860,9 @@ def analyze_commitments(directory):
                         r["target_probability"] - b["target_probability"] for r, b in pairs]))} if pairs else {}),
             }
     summary = {
-        "coverage": {"planned_episodes": 2880, "initial_decisions": len(first),
+        "coverage": {"planned_episodes": planned_episodes, "initial_decisions": len(first),
                      "completed_episodes": len(episodes), "behavior_decisions": sum(r.get("phase") == "behavior" for r in rows),
-                     "planned_binding_records": 2880, "binding_records": len(binding),
+                     "planned_binding_records": planned_binding, "binding_records": len(binding),
                      "calibration_records": sum(r.get("phase") == "calibration" for r in rows),
                      "diagnostic_records": len(checks), "prediction_records": len(rows)},
         "behavior": behavior, "binding": tasks, "decision_steps": decision_steps,

@@ -13,7 +13,7 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import balanced_accuracy_score, r2_score
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
-from analysis import CONDITIONS, CORE, QUERIES, analyze, analyze_pilot, read_jsonl
+from analysis import CONDITIONS, CORE, QUERIES, WORKSPACE_CONDITIONS, analyze, analyze_pilot, read_jsonl
 from skin import generate_trials, make_prefix, simulate_action
 
 
@@ -218,27 +218,32 @@ class Policy:
         self.args = args
         self.output = Path(args.output)
         self.output.mkdir(parents=True, exist_ok=True)
+        forward_path = self.output / "forwards.jsonl"
+        forwards = read_jsonl(forward_path) if forward_path.exists() else []
+        self.attempted = sum(row["sequences"] for row in forwards)
+        self.call_index = len(forwards)
         if args.stage.startswith(("commitment", "workspace")):
             budget_path = self.output / "budget.json"
-            if budget_path.exists():
-                self.budget = json.loads(budget_path.read_text())
-            else:
-                previous_calls = self.output / "forwards.jsonl"
-                previous = read_jsonl(previous_calls) if previous_calls.exists() else []
-                start = min((row["time"] for row in previous), default=getattr(args, "started_unix", None) or time.time())
-                deadline = min(getattr(args, "deadline_unix", None) or float("inf"), start + min(args.max_hours, 3) * 3600)
-                self.budget = {"started_unix": start, "deadline_unix": deadline,
-                               "max_forwards": min(args.max_forwards, 32000), "max_vjps": min(args.max_vjps, 1152)}
-                write_json(budget_path, self.budget)
+            saved = json.loads(budget_path.read_text()) if budget_path.exists() else {}
+            start = saved.get("started_unix", min(
+                (row["time"] for row in forwards),
+                default=getattr(args, "started_unix", None) or time.time()))
+            # A resume keeps the original clock and may tighten, never extend, its limits.
+            self.budget = {
+                "started_unix": start,
+                "deadline_unix": min(saved.get("deadline_unix", float("inf")),
+                                     getattr(args, "deadline_unix", None) or float("inf"),
+                                     start + min(args.max_hours, 3) * 3600),
+                "max_forwards": min(saved.get("max_forwards", 32000), args.max_forwards, 32000),
+                "max_vjps": min(saved.get("max_vjps", 1152), args.max_vjps, 1152),
+            }
+            write_json(budget_path, self.budget)
         else:
             self.budget = None
         self.vjp_count = len(read_jsonl(self.output / "vjps.jsonl")) if (self.output / "vjps.jsonl").exists() else 0
         self.started = time.monotonic()
         usage_path = self.output / "usage.json"
         self.elapsed_before = json.loads(usage_path.read_text())["elapsed_seconds"] if usage_path.exists() else 0.0
-        usage = self.output / "forwards.jsonl"
-        self.attempted = sum(r["sequences"] for r in read_jsonl(usage)) if usage.exists() else 0
-        self.call_index = len(read_jsonl(usage)) if usage.exists() else 0
         self.check_budget()
         torch.manual_seed(args.seed)
         for device in range(torch.cuda.device_count()):
@@ -1147,26 +1152,34 @@ def run_pilot(args, physical, variants):
 
 
 def prepare_commitments(args):
+    from skin import COMMITMENT_PROTOCOL, BINDING_QUERIES
     from skin import create_commitment_trials, binding_variants, create_binding_calibration
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    expected = {
+        "trials": create_commitment_trials(args.seed),
+        "calibration": create_binding_calibration(args.seed, include_controls=True),
+    }
+    expected["binding"] = binding_variants(expected["trials"])
     data = {}
-    for name, create in (("trials", create_commitment_trials),
-                         ("calibration", lambda seed: create_binding_calibration(seed, include_controls=True))):
+    for name, trials in expected.items():
         path = output / f"{name}.jsonl"
-        if not path.exists():
-            path.write_text("".join(json.dumps(t) + "\n" for t in create(args.seed)))
-        data[name] = read_jsonl(path)
-    path = output / "binding.jsonl"
-    if not path.exists():
-        path.write_text("".join(json.dumps(t) + "\n" for t in binding_variants(data["trials"])))
-    data["binding"] = read_jsonl(path)
-    if len(data["trials"]) != 2880 or len(data["binding"]) != 240:
-        raise ValueError("The pilot requires 2880 episodes and 240 binding observations")
+        existing = read_jsonl(path) if path.exists() else []
+        recorded = {trial["id"]: trial for trial in existing}
+        expected_ids = {trial["id"] for trial in trials}
+        if len(recorded) != len(existing) or set(recorded) - expected_ids:
+            raise ValueError(f"{path} contains duplicate or different-protocol trial IDs")
+        missing = [trial for trial in trials if trial["id"] not in recorded]
+        if missing:
+            with path.open("a") as stream:
+                stream.writelines(json.dumps(trial) + "\n" for trial in missing)
+            recorded.update({trial["id"]: trial for trial in missing})
+        data[name] = [recorded[trial["id"]] for trial in trials]
     settings = output / "settings.json"
     if not settings.exists():
-        write_json(settings, {**vars(args), "experiment": "competing_commitments",
-                             "episodes": 2880, "max_steps": 4, "binding_forwards": 2880,
+        write_json(settings, {**vars(args), "experiment": "competing_commitments", "protocol": COMMITMENT_PROTOCOL,
+                             "episodes": len(data["trials"]), "max_steps": 4,
+                             "binding_forwards": len(data["binding"]) * len(BINDING_QUERIES) * 3,
                              "max_total_forwards": 32000, "max_total_vjps": 1152,
                              "max_wall_hours": 3, "intervention_layer": 48,
                              "intervention": "Own-contact minus other-contact mean difference from independent calibration",
@@ -1177,14 +1190,10 @@ def prepare_commitments(args):
 
 
 def commitment_prompt(trial, state=None):
-    from skin import COMMITMENT_SYSTEM, BINDING_QUERIES, make_commitment_prefix, commitment_question
+    from skin import BINDING_QUERIES, commitment_system, make_commitment_prefix, commitment_question
     state_suffix = f":step{state['step']}" if state is not None else ""
-    system = COMMITMENT_SYSTEM
-    if trial.get("ownership_frame") == "instrument":
-        system = system.replace("The MuJoCo tactile pad assigned to your body represents its artificial skin and contact surface.",
-                                "The assigned MuJoCo tactile pad is an external contact instrument controlled by you.")
     return {**trial, "id": trial["id"] + state_suffix,
-            "system_prompt": system, "response_symbols": ["X", "Y", "Z"],
+            "system_prompt": commitment_system(trial), "response_symbols": ["X", "Y", "Z"],
             "observation_boundary": True, "prefix": make_commitment_prefix(trial, state),
             "questions": {q: commitment_question(trial, q, state) for q in BINDING_QUERIES}}
 
@@ -1193,7 +1202,8 @@ def commitment_metadata(trial):
     return {"scene_id": trial["scenario_id"], "title": trial["scenario"]["title"],
             "scene_kind": "clear_duty" if trial["scenario"]["clear_duty"] else "self_risk",
             "stimulus": trial["signal_condition"], "depth_mm": trial["depth_mm"],
-            "cost": trial["exit_cost"], "delay": trial["handover_delay"],
+            "cost": trial["exit_cost"], "abandon_cost": trial.get("abandon_cost", trial["exit_cost"]),
+            "protocol": trial.get("protocol"), "delay": trial["handover_delay"],
             "effective": trial["abandon_relief"], "rotation": trial["code_rotation"],
             "own_pad": trial["own_pad"], "stimulated_pad": trial["stimulated_pad"],
             "wiring": trial["wiring"]}
@@ -1239,7 +1249,8 @@ def run_commitment_behavior(policy, trials):
                 else:
                     next_active.append((trial, updated))
             if (start // policy.args.batch_size) % 20 == 0:
-                print(f"Behavior: {len(finished)}/2880 episodes complete, {policy.attempted} attempted sequences", flush=True)
+                print(f"Behavior: {len(finished)}/{len(trials)} episodes complete, "
+                      f"{policy.attempted} attempted sequences", flush=True)
         active = next_active
     print(f"Behavior complete: {len(finished)} episodes", flush=True)
 
@@ -1370,7 +1381,7 @@ def run_commitment(args):
     run_args.output = str(root / args.part)
     if args.part != "all":
         run_args.max_forwards = min(args.max_forwards, 16000)
-        run_args.max_vjps = 1152 if args.part == "mechanism" else 0
+        run_args.max_vjps = min(args.max_vjps, 1152) if args.part == "mechanism" else 0
     policy = Policy(run_args)
     try:
         if args.part in ("all", "behavior"):
@@ -1416,8 +1427,8 @@ def select_workspace_readout_cases(trials, subset_ids):
     return cases
 
 
-def run_workspace_readouts(args):
-    """Capture all prompt tokens with the completed experiment's fixed 12-word lens."""
+def load_workspace_readout_source(args):
+    """Reuse the source model, saved cases, and fitted lens for either token view."""
     if not args.source_output:
         raise ValueError("--source-output must identify a completed workspace result")
     source, output = Path(args.source_output).resolve(), Path(args.output).resolve()
@@ -1430,11 +1441,17 @@ def run_workspace_readouts(args):
     trials = read_jsonl(source / "trials.jsonl")
     subset = json.loads((source / "intervention_subset.json").read_text())["trial_ids"]
     cases = select_workspace_readout_cases(trials, set(subset))
-    previous = {row["id"]: row for row in read_jsonl(source / "predictions.jsonl")}
     with np.load(source / "workspace_lens.npz") as data:
         lens = dict(data)
+    return source, output, cases, lens
+
+
+def run_workspace_readouts(args):
+    """Capture all prompt tokens with the completed experiment's fixed 12-word lens."""
+    source, output, cases, lens = load_workspace_readout_source(args)
+    previous = {row["id"]: row for row in read_jsonl(source / "predictions.jsonl")}
     layers = lens["layers"].astype(int).tolist()
-    conditions = ("baseline", "identity", "swap", "random", "erase", "restore_good", "restore_other")
+    conditions = WORKSPACE_CONDITIONS
     manifest_path = output / "manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
@@ -1548,24 +1565,13 @@ def run_workspace_readouts(args):
 
 def run_workspace_generated_readouts(args):
     """Add actual generated answers without changing the candidate-scoring results."""
-    if not args.source_output or args.max_new_tokens < 1:
-        raise ValueError("Generated readouts require --source-output and positive --max-new-tokens")
-    source, output = Path(args.source_output).resolve(), Path(args.output).resolve()
-    if source == output:
-        raise ValueError("Generated readouts need a separate output directory")
-    output.mkdir(parents=True, exist_ok=True)
-    saved = json.loads((source / "settings.json").read_text())
-    for name in ("model", "model_id", "seed"):
-        setattr(args, name, saved[name])
-    trials = read_jsonl(source / "trials.jsonl")
-    subset = json.loads((source / "intervention_subset.json").read_text())["trial_ids"]
-    candidates = select_workspace_readout_cases(trials, set(subset))
+    if args.max_new_tokens < 1:
+        raise ValueError("Generated readouts require positive --max-new-tokens")
+    source, output, candidates, lens = load_workspace_readout_source(args)
     skin = [case for case in candidates if case[2] == "self/other"
             and case[0]["own_pad"] == case[0]["stimulated_pad"] == "A"]
     skin.sort(key=lambda case: case[0]["modality"] != "image_text")
     cases = [candidates[0], skin[0]]
-    with np.load(source / "workspace_lens.npz") as data:
-        lens = dict(data)
     layers = lens["layers"].astype(int).tolist()
     manifest_path = output / "generation_manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {
@@ -1665,13 +1671,16 @@ def run_workspace(args):
         print(json.dumps(analyze_workspace(args.output), indent=2))
         return
     from jlens import fit_workspace_lens
-    from skin import create_workspace_control_trials, create_workspace_skin_trials
+    from skin import COMMITMENT_PROTOCOL, create_workspace_control_trials, create_workspace_skin_trials
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     trials_path = output / "trials.jsonl"
     if trials_path.exists():
         trials = read_jsonl(trials_path)
+        if any(trial.get("protocol") != COMMITMENT_PROTOCOL
+               for trial in trials if "concept_pair" not in trial):
+            raise ValueError("Saved skin trials use a different experimental protocol")
     else:
         trials = (create_workspace_control_trials()
                   + create_workspace_skin_trials(output / "stimuli", seed=args.seed))
@@ -1680,7 +1689,7 @@ def run_workspace(args):
         print(f"Prepared {len(trials)} control and skin observations", flush=True)
         return
     policy = Policy(args)
-    conditions = ("baseline", "identity", "swap", "random", "erase", "restore_good", "restore_other")
+    conditions = WORKSPACE_CONDITIONS
     concepts = ("France", "China", "spider", "ant", "self", "other",
                 "pain", "relief", "pressure", "calm", "harm", "safe")
     words = []
@@ -1693,7 +1702,7 @@ def run_workspace(args):
         words.append(selected)
     count = len(policy.layers)
     layers = list(range(max(1, round(count * .4)), min(count - 1, round(count * .8)) + 1))
-    settings = {**vars(args), "experiment": "workspace_extension", "words": words,
+    settings = {**vars(args), "experiment": "workspace_extension", "protocol": COMMITMENT_PROTOCOL, "words": words,
                 "source_layers": layers, "target_layer": count - 1, "conditions": conditions,
                 "skin_coordinate_pairs": [["self", "other"], ["pain", "relief"]],
                 "control_scope": "all prompt positions", "skin_scope": "observation before the question",
@@ -1835,7 +1844,7 @@ def main():
     parser.add_argument("--started-unix", type=float)
     parser.add_argument("--deadline-unix", type=float)
     parser.add_argument("--max-hours", type=float, default=3.0,
-                        help="Cumulative model-process runtime limit, including loading")
+                        help="Wall-clock cap from --started-unix, including model loading")
     args = parser.parse_args()
     output = Path(args.output)
     if args.stage.startswith("workspace"):
